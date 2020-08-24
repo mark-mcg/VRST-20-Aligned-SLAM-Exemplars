@@ -1,0 +1,137 @@
+---
+title: "Using Trilateration to Assess SLAM Tracking"
+author: "Mark McGill"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE)
+chooseCRANmirror(graphics=FALSE, ind=1)
+library(dplyr)
+library(ggplot2)
+library(NISTunits)
+library(cowplot)
+library(shiny)
+library(raster)
+library(knitr)
+library(cowplot)
+source("log_utils.R")
+logUtilsSetup()
+```
+
+First, we use trilateration (see https://en.wikipedia.org/wiki/True_range_multilateration) to determine the positions of our points of interest for assessing the SLAM tracking. We do this by having two defined points (C1 and C2) which have known (x,y) positions. Then, for every point of interest we'll be taking measurements at, we record the distance from C1 and C2 to the given point (R1 for distance from C1, R2 for distance from C2). Finally, we have the sign to use - the trilateriation calculation cannot determine whether the calculate y coordinate is + or -, so for each measured point, note yourself whether it is above or below the x axis line you defined with C1/C2.
+
+Fill out C1, C2, R1, R2, and sign appropriately.
+
+```{r}
+C1 <- c(0,0)
+C2 <- c(2.660,0)
+measured.distance.R1 <- c(1.423,1.474, 0.813, 0.815, 1.829, 1.841)
+measured.distance.R2 <- c(1.474, 1.418, 1.874, 1.881, 0.869, 0.862)
+measured.sign <- c(1,-1,-1,1,1,-1)
+measured.ids <- c(1,3,2,4,5,6,7,8)
+
+# Distance between C1 and C2
+U <- pointDistance(C1, C2, lonlat = FALSE)
+```
+
+Now, for each of these pairs of distances, we use trilateriation to calculate their (x,y) positions in real world space relative to C1/C2.
+
+```{r trilateration, echo=TRUE, message=TRUE}
+# 
+trilateration <- function(U, r1, r2, sign){
+  x = (r1^2 - r2^2 + U^2) / (2*U)
+  y = sqrt(r1^2 - x^2) * sign
+  df <- data.frame(x, y)
+  colnames(df) <- c("realcenter.x","realcenter.z")
+  return(df)
+}
+
+trilateration_positions <- trilateration(U, measured.distance.R1, measured.distance.R2, measured.sign)
+
+# Append our two start positions as well (we might be measuring them too)
+trilateration_positions <- rbind(C2, trilateration_positions)
+trilateration_positions <- rbind(C1, trilateration_positions)
+
+#trilateration_positions$id <- seq.int(nrow(trilateration_positions))
+trilateration_positions$pointID <- measured.ids
+
+kable(trilateration_positions, caption="Trilateration coords")
+
+p<- ggplot(trilateration_positions, aes(x=realcenter.x, y=realcenter.z, color=factor(pointID)))
+p<- p + geom_point()
+print(p)
+```
+
+Now, load the SLAM-tracked device log files we'll be examining
+
+```{r}
+SlamLogs = loadLogs("/", "log_on_action_", ".json", FALSE)
+SlamLogs <- subset(SlamLogs, pointID != 0) # points that failed to capture
+SlamLogs$DeviceName <- factor(SlamLogs$DeviceName, levels=c("ARCore Device", "Camera_eyes", "Loggable Unity XR Player"), labels=c("ARCore", "ZED Mini", "Oculus Quest"))
+
+StartTimes <-  ddply(SlamLogs, session ~ DeviceName, summarize, startTime=min(timeSinceStartObjectCreated))
+SlamLogs <- merge(SlamLogs, StartTimes, c("session", "DeviceName"))
+SlamLogs$timeSinceStart <- SlamLogs$timeSinceStartObjectCreated - SlamLogs$startTime
+```
+
+
+Plot the distribution of points by point id and device
+
+```{r}
+plot_absolute <- ggplot(data = SlamLogs, aes(x=WorldPosition.x, y=WorldPosition.z) ) +
+  geom_point(data = trilateration_positions, aes(x=realcenter.x, y=realcenter.z), color="Red", shape=1, size=5, alpha=0.3 ) +
+  geom_point(data = SlamLogs, aes(x=WorldPosition.x, y=WorldPosition.z), size=0.2, alpha=0.1, colour="blue" ) + 
+  facet_grid ( ~ DeviceName) +   scale_colour_viridis_c() + ylim(-2,2) + xlim(-0.5, 3.5) +   theme(aspect.ratio = 1)+ 
+  ylab("Position on z (m)") + xlab("Position on x (m)")# try with and without
+plot_absolute
+savePlot(plot_absolute, "plot_absolute", 6,3)
+
+```
+
+For each device and for each point id, we want to calculate the points relative to their mean center (precision), and relative to their target center (accuracy), and then for each calculate the euclidean distance.
+
+First, get the mean centers, and merge the trilateriation points and mean center points with our data.
+
+```{r}
+SlamLogs <- merge(SlamLogs, trilateration_positions,by="pointID")
+MeanCenters <- ddply(SlamLogs, DeviceName ~ pointID, summarize, mean.x=mean(WorldPosition.x), mean.z=mean(WorldPosition.z))
+SlamLogs <- merge(SlamLogs, MeanCenters, by=c("pointID", "DeviceName"))
+```
+
+
+Now calculate the distances between the captured points and the real points/mean centers
+```{r}
+vectorizePointDistance <- function(x1, y1, x2, y2){
+  return(pointDistance(c(x1, y1),c(x2,y2),lonlat=FALSE))
+}
+
+SlamLogs$DistanceFromMeanCenter <- mapply(vectorizePointDistance, SlamLogs$mean.x, SlamLogs$mean.z, SlamLogs$WorldPosition.x, SlamLogs$WorldPosition.z)
+
+SlamLogs$DistanceFromActualCenter <- mapply(vectorizePointDistance, SlamLogs$realcenter.x, SlamLogs$realcenter.z, SlamLogs$WorldPosition.x, SlamLogs$WorldPosition.z)
+
+MeanDistanceFromMeanCenter = ddply(SlamLogs, .(DeviceName), summarize, mean=mean(DistanceFromMeanCenter), sd=sd(DistanceFromMeanCenter))
+kable(MeanDistanceFromMeanCenter, caption="MeanDistanceFromMeanCenter")
+
+MeanDistanceFromActualCenter = ddply(SlamLogs, .(DeviceName), summarize, mean=mean(DistanceFromActualCenter), sd=sd(DistanceFromActualCenter))
+kable(MeanDistanceFromActualCenter, caption="MeanDistanceFromActualCenter")
+
+```
+And finally plot the distribution of points relative to the target point
+
+```{r}
+SlamLogs$WorldPosition.RelativeToReal.x <- SlamLogs$WorldPosition.x - SlamLogs$realcenter.x
+SlamLogs$WorldPosition.RelativeToReal.z <- SlamLogs$WorldPosition.z - SlamLogs$realcenter.z
+
+plot_relative <- ggplot(data = SlamLogs, aes(x=WorldPosition.RelativeToReal.x, y=WorldPosition.RelativeToReal.z) ) +
+  geom_point(data = SlamLogs, aes(x=WorldPosition.RelativeToReal.x, y=WorldPosition.RelativeToReal.z, color=timeSinceStart), size=0.3, alpha=0.2) + 
+  facet_grid ( ~ DeviceName) + scale_color_viridis_c() + ylim(-0.3, 0.3) + xlim(-0.3, 0.3) +   theme(aspect.ratio = 1) +
+  xlab("Position on x relative to target (m)") + ylab("Position on z \nrelative to target (m)") + labs(color="Time since\nstart (seconds)")
+
+plot_relative
+savePlot(plot_relative, "plot_relative", 6,3)
+
+```
+
