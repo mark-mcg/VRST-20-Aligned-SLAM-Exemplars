@@ -46,6 +46,7 @@ public class CollocatedNetworkManager : NetworkManager
 
     protected void Connect()
     {
+        Debug.LogFormat("Connect called, using address {0}", this.networkAddress); 
         if (Client && Server)
             StartHost();
 
@@ -141,8 +142,12 @@ public class CollocatedNetworkManager : NetworkManager
 
         // Then write the config back out (if it didn't already exist) so we can manually edit it later after first run
         if (networkConfig == null)
+        {
             networkConfig = new NetworkConfig();
-        networkConfig.ipaddress = transportIP;
+            networkConfig.ipaddress = transportIP;
+        }
+
+        this.networkAddress = networkConfig.ipaddress;
 
         StreamWriter streamWriter = FileHelpers.GetStreamWriter(filepath);
         if (streamWriter != null)
